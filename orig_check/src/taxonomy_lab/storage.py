@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -116,7 +116,6 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
-    lease_operator TEXT REFERENCES users(user_id),
     lease_expires_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
@@ -170,7 +169,7 @@ REQUIRED_TABLES = frozenset({
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
+    connection = sqlite3.connect(str(path), isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -195,13 +194,7 @@ def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
-    job_columns = {row[1] for row in connection.execute("PRAGMA table_info(analysis_jobs)")}
     with transaction(connection, immediate=True):
-        if "lease_operator" not in job_columns:
-            # 版本 2 的库在重启后补齐租约操作者列，已有租约数据保留。
-            connection.execute(
-                "ALTER TABLE analysis_jobs ADD COLUMN lease_operator TEXT REFERENCES users(user_id)"
-            )
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from .errors import ServiceError, ValidationFailed
 from .service import TaxonomyLabService
@@ -28,8 +27,6 @@ class JsonApplication:
 
     def __init__(self, service: TaxonomyLabService) -> None:
         self.service = service
-        # 单条 SQLite 连接由所有请求线程共享，串行化请求处理。
-        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -51,12 +48,6 @@ class JsonApplication:
         return value
 
     def handle(
-        self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
-    ) -> Response:
-        with self._lock:
-            return self._handle(method, target, headers, body)
-
-    def _handle(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
@@ -124,33 +115,16 @@ class JsonApplication:
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(
-                    self._actor(normalized_headers), payload["worker_id"], int(payload.get("lease_seconds", 60))
-                )
+                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})
-            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "renew":
-                result = self.service.renew_job(
-                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
-                    int(payload.get("lease_seconds", 60)),
-                )
-                return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    self._actor(normalized_headers), payload["worker_id"], int(parts[1])
+                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
-                    payload["error"], int(payload.get("retry_seconds", 0)),
-                )
-                return Response(200, result)
-            if method == "GET" and path == "/audit/events":
-                query = parse_qs(urlparse(target).query)
-                result = self.service.audit_events(
-                    self._actor(normalized_headers),
-                    query.get("entity_type", [None])[0],
-                    query.get("entity_id", [None])[0],
+                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
