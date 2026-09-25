@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT,
+    lease_operator TEXT REFERENCES users(user_id),
+    lease_token INTEGER NOT NULL DEFAULT 0,
     lease_expires_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
@@ -166,10 +168,21 @@ REQUIRED_TABLES = frozenset({
 })
 
 
+# 逐版本迁移：为已存在的旧库补充租约追溯列，队列与审计数据保持不变。
+MIGRATIONS = {
+    3: (
+        "ALTER TABLE analysis_jobs ADD COLUMN lease_operator TEXT REFERENCES users(user_id)",
+        "ALTER TABLE analysis_jobs ADD COLUMN lease_token INTEGER NOT NULL DEFAULT 0",
+    ),
+}
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    # check_same_thread=False 允许 HTTP 工作线程共享连接；调用方（如
+    # JsonApplication）必须用锁串行化请求，保证事务边界不交错。
+    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -191,10 +204,18 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
 
 
 def initialize(connection: sqlite3.Connection) -> None:
-    """初始化基础资料表，重复执行不改变已有数据。"""
+    """初始化基础资料表并迁移旧版本，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    row = connection.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    # 全新库由 SCHEMA_SQL 直接建成最新结构；只有旧库才需要逐版本迁移。
+    current = int(row["value"]) if row is not None else SCHEMA_VERSION
     with transaction(connection, immediate=True):
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS.get(version, ()):
+                connection.execute(statement)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

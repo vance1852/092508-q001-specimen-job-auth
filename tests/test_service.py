@@ -47,8 +47,8 @@ class ServiceTests(unittest.TestCase):
         imported = self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.assertEqual(imported["inserted"], 6)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker", 30)
-        analysis = self.service.complete_job("worker", job["job_id"], "stat")
+        job = self.service.claim_job("stat", "worker", 30)
+        analysis = self.service.complete_job("stat", "worker", job["job_id"], job["lease_token"])
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
@@ -99,25 +99,25 @@ class ServiceTests(unittest.TestCase):
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
         self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker-a", 10)
-        failed = self.service.fail_job("worker-a", job["job_id"], "临时计算失败", retry_seconds=5)
+        job = self.service.claim_job("stat", "worker-a", 10)
+        failed = self.service.fail_job("stat", "worker-a", job["job_id"], job["lease_token"], "临时计算失败", retry_seconds=5)
         self.assertEqual(failed["state"], "queued")
-        self.assertIsNone(self.service.claim_job("worker-b", 10))
+        self.assertIsNone(self.service.claim_job("stat", "worker-b", 10))
         self.clock.advance(seconds=5)
-        retried = self.service.claim_job("worker-b", 10)
+        retried = self.service.claim_job("stat", "worker-b", 10)
         self.assertEqual(retried["job_id"], job["job_id"])
         self.assertEqual(retried["attempts"], 2)
 
     def test_lease_can_be_reclaimed_after_expiry(self) -> None:
         self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        first = self.service.claim_job("worker-a", 10)
+        first = self.service.claim_job("stat", "worker-a", 10)
         self.clock.advance(seconds=11)
-        second = self.service.claim_job("worker-b", 10)
+        second = self.service.claim_job("stat", "worker-b", 10)
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
-            self.service.complete_job("worker-a", first["job_id"], "stat")
+            self.service.complete_job("stat", "worker-a", first["job_id"], first["lease_token"])
 
 
 if __name__ == "__main__":

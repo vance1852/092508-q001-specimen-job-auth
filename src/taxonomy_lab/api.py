@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,14 @@ class JsonApplication:
 
     def __init__(self, service: TaxonomyLabService) -> None:
         self.service = service
+        # 单个 SQLite 连接被多线程服务器共享，请求必须串行进入服务层。
+        self._lock = threading.Lock()
+
+    def handle(
+        self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
+    ) -> Response:
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -47,7 +56,7 @@ class JsonApplication:
             raise ValidationFailed("请求体必须是 JSON 对象")
         return value
 
-    def handle(
+    def _dispatch(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
@@ -115,16 +124,25 @@ class JsonApplication:
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
+                result = self.service.claim_job(
+                    self._actor(normalized_headers), payload["worker_id"], int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "renew":
+                result = self.service.renew_job(
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
+                    int(payload["lease_token"]), int(payload.get("lease_seconds", 60)),
+                )
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]), int(payload["lease_token"])
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    self._actor(normalized_headers), payload["worker_id"], int(parts[1]),
+                    int(payload["lease_token"]), payload["error"], int(payload.get("retry_seconds", 0)),
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":

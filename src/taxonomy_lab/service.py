@@ -362,27 +362,157 @@ class TaxonomyLabService:
             self._audit("batch", batch_id, "batch.sealed", actor_id, {"revision": new_revision})
         return self.get_batch(batch_id)
 
-    def claim_job(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+    QUEUE_ENTITY_TYPE = "analysis_queue"
+    QUEUE_ENTITY_ID = "analysis_jobs"
+
+    def _require_lease_operator(self, actor_id: str) -> sqlite3.Row:
+        """领取链路统一入口：账号必须存在、未停用且具备鉴定职责。"""
+
+        return self._require(actor_id, "analysis.run")
+
+    def _audit_lease_rejection(
+        self, entity_type: str, entity_id: str, event_type: str, actor_id: str, payload: Mapping[str, Any]
+    ) -> None:
+        """拒绝也必须留痕：在独立事务中记录，随后再抛出原错误。"""
+
+        with transaction(self.connection, immediate=True):
+            self._audit(entity_type, entity_id, event_type, actor_id, payload)
+
+    def _require_queue_access(self, event_type: str, actor_id: str, payload: Mapping[str, Any]) -> None:
+        try:
+            self._require_lease_operator(actor_id)
+        except (NotFound, Forbidden) as exc:
+            self._audit_lease_rejection(
+                self.QUEUE_ENTITY_TYPE, self.QUEUE_ENTITY_ID, event_type, actor_id,
+                {**payload, "reason": str(exc)},
+            )
+            raise
+
+    def claim_job(self, actor_id: str, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+        if not worker_id or not worker_id.strip():
+            raise ValidationFailed("工作节点编号不能为空")
+        worker_id = worker_id.strip()
         if lease_seconds <= 0:
             raise ValidationFailed("租约时长必须大于零")
+        self._require_queue_access(
+            "analysis_job.claim_rejected", actor_id, {"worker_id": worker_id}
+        )
         now = self._now()
         expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
         with transaction(self.connection, immediate=True):
+            held = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE state='leased' AND lease_owner=? AND lease_operator=? "
+                "AND lease_expires_at>? ORDER BY job_id LIMIT 1",
+                (worker_id, actor_id, now),
+            ).fetchone()
+            if held is not None:
+                # 重复领取同一租约：不改变任何状态，直接返回原租约。
+                return dict(held)
             row = self.connection.execute(
-                "SELECT job_id FROM analysis_jobs WHERE "
+                "SELECT * FROM analysis_jobs WHERE "
                 "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
                 "ORDER BY available_at,job_id LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
                 return None
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,updated_at=? "
-                "WHERE job_id=?",
-                (worker_id, expires, now, row["job_id"]),
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='leased',attempts=attempts+1,lease_owner=?,lease_operator=?,"
+                "lease_token=lease_token+1,lease_expires_at=?,updated_at=? "
+                "WHERE job_id=? AND ((state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?))",
+                (worker_id, actor_id, expires, now, row["job_id"], now, now),
             )
-            claimed = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
+            if cursor.rowcount != 1:
+                raise Conflict("分析任务状态已变化，请重新领取")
+            claimed = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (row["job_id"],)
+            ).fetchone()
+            payload: dict[str, Any] = {
+                "job_id": row["job_id"],
+                "worker_id": worker_id,
+                "operator_id": actor_id,
+                "lease_token": claimed["lease_token"],
+                "lease_expires_at": expires,
+                "attempt": claimed["attempts"],
+            }
+            if row["state"] == "leased" and (
+                row["lease_owner"] != worker_id or row["lease_operator"] != actor_id
+            ):
+                event_type = "analysis_job.taken_over"
+                payload.update({
+                    "previous_owner": row["lease_owner"],
+                    "previous_operator": row["lease_operator"],
+                    "previous_lease_token": row["lease_token"],
+                    "reason": "原租约已过期，由合格人员接管",
+                })
+            else:
+                event_type = "analysis_job.claimed"
+            self._audit("batch", row["batch_id"], event_type, actor_id, payload)
         return dict(claimed)
+
+    def _lease_rejection_reason(
+        self, job: sqlite3.Row, actor_id: str, worker_id: str, lease_token: int
+    ) -> str | None:
+        if job["state"] != "leased":
+            return f"任务当前状态为 {job['state']}，不在租约中"
+        if job["lease_owner"] != worker_id or job["lease_operator"] != actor_id:
+            return "任务未由当前操作者与节点持有"
+        if job["lease_token"] != lease_token:
+            return "租约令牌已变更，任务可能已被接管"
+        if job["lease_expires_at"] <= self._now():
+            return "任务租约已经过期"
+        return None
+
+    def _leased_job(
+        self, event_type: str, actor_id: str, worker_id: str, job_id: int, lease_token: int
+    ) -> sqlite3.Row:
+        """校验操作者身份与租约 fencing；拒绝时留痕并抛出。"""
+
+        self._require_queue_access(
+            event_type, actor_id, {"job_id": job_id, "worker_id": worker_id}
+        )
+        job = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise NotFound("分析任务不存在")
+        reason = self._lease_rejection_reason(job, actor_id, worker_id, lease_token)
+        if reason is not None:
+            self._audit_lease_rejection(
+                "batch", job["batch_id"], event_type, actor_id,
+                {"job_id": job_id, "worker_id": worker_id, "lease_token": lease_token, "reason": reason},
+            )
+            raise InvalidState(reason)
+        return job
+
+    def renew_job(
+        self, actor_id: str, worker_id: str, job_id: int, lease_token: int, lease_seconds: int = 60
+    ) -> dict[str, Any]:
+        if lease_seconds <= 0:
+            raise ValidationFailed("租约时长必须大于零")
+        job = self._leased_job("analysis_job.renew_rejected", actor_id, worker_id, job_id, lease_token)
+        now = self._now()
+        expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET lease_expires_at=?,lease_token=lease_token+1,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_operator=? "
+                "AND lease_token=? AND lease_expires_at>?",
+                (expires, now, job_id, worker_id, actor_id, lease_token, now),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务租约已变化，无法续租")
+            renewed = self.connection.execute(
+                "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            self._audit("batch", job["batch_id"], "analysis_job.renewed", actor_id, {
+                "job_id": job_id,
+                "worker_id": worker_id,
+                "operator_id": actor_id,
+                "lease_token": renewed["lease_token"],
+                "lease_expires_at": expires,
+            })
+        return dict(renewed)
 
     def _analysis_evidence_items(self, batch_id: str, evidence_protocol: EvidenceProtocol) -> tuple[EvidenceItem, ...]:
         rows = self.connection.execute(
@@ -407,15 +537,8 @@ class TaxonomyLabService:
             ))
         return tuple(items)
 
-    def complete_job(self, worker_id: str, job_id: int, statistician_id: str) -> dict[str, Any]:
-        self._require(statistician_id, "analysis.run")
-        job = self.connection.execute("SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)).fetchone()
-        if job is None:
-            raise NotFound("分析任务不存在")
-        if job["state"] != "leased" or job["lease_owner"] != worker_id:
-            raise InvalidState("任务未由当前工作进程持有")
-        if job["lease_expires_at"] <= self._now():
-            raise InvalidState("任务租约已经过期")
+    def complete_job(self, actor_id: str, worker_id: str, job_id: int, lease_token: int) -> dict[str, Any]:
+        job = self._leased_job("analysis_job.complete_rejected", actor_id, worker_id, job_id, lease_token)
         batch = self.get_batch(job["batch_id"])
         evidence_protocol, evidence_protocol_digest = self._evidence_protocol(batch["evidence_protocol_id"], batch["evidence_protocol_version"])
         evidence_items = self._analysis_evidence_items(batch["batch_id"], evidence_protocol)
@@ -438,22 +561,24 @@ class TaxonomyLabService:
             ).fetchone()
             if existing is None:
                 cursor = self.connection.execute(
-                    "INSERT INTO analyses(batch_id,batch_revision,evidence_protocol_sha256,input_sha256,algorithm_version,seed," 
+                    "INSERT INTO analyses(batch_id,batch_revision,evidence_protocol_sha256,input_sha256,algorithm_version,seed,"
                     "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         batch["batch_id"], job["batch_revision"], evidence_protocol_digest, input_digest,
-                        ALGORITHM_VERSION, evidence_protocol.seed, canonical_json(result), statistician_id, self._now(),
+                        ALGORITHM_VERSION, evidence_protocol.seed, canonical_json(result), actor_id, self._now(),
                     ),
                 )
                 analysis_id = cursor.lastrowid
             else:
                 analysis_id = existing["analysis_id"]
                 result = json.loads(existing["result_json"])
-            self.connection.execute(
-                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,updated_at=? "
-                "WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (self._now(), job_id, worker_id),
+            cursor = self.connection.execute(
+                "UPDATE analysis_jobs SET state='succeeded',lease_owner=NULL,lease_operator=NULL,lease_expires_at=NULL,"
+                "updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_operator=? AND lease_token=?",
+                (self._now(), job_id, worker_id, actor_id, lease_token),
             )
+            if cursor.rowcount != 1:
+                raise InvalidState("任务租约已变化，迟到提交不能覆盖当前结果")
             self.connection.execute(
                 "UPDATE batches SET state='analyzed' WHERE batch_id=? AND state IN ('sealed','analyzing')",
                 (batch["batch_id"],),
@@ -461,22 +586,71 @@ class TaxonomyLabService:
             self._audit(
                 "batch",
                 batch["batch_id"],
-                "analysis.completed",
-                statistician_id,
-                {"analysis_id": analysis_id, "input_sha256": input_digest},
+                "analysis_job.completed",
+                actor_id,
+                {
+                    "job_id": job_id,
+                    "worker_id": worker_id,
+                    "operator_id": actor_id,
+                    "lease_token": lease_token,
+                    "analysis_id": analysis_id,
+                    "input_sha256": input_digest,
+                },
             )
         return {"analysis_id": analysis_id, "input_sha256": input_digest, "result": result}
 
-    def fail_job(self, worker_id: str, job_id: int, error: str, retry_seconds: int = 0) -> dict[str, Any]:
+    def fail_job(
+        self,
+        actor_id: str,
+        worker_id: str,
+        job_id: int,
+        lease_token: int,
+        error: str,
+        retry_seconds: int = 0,
+    ) -> dict[str, Any]:
+        if retry_seconds < 0:
+            raise ValidationFailed("重试延迟不能为负数")
+        self._require_queue_access(
+            "analysis_job.fail_rejected", actor_id, {"job_id": job_id, "worker_id": worker_id}
+        )
+        job = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if job is None:
+            raise NotFound("分析任务不存在")
+        # 失败只释放租约、不写入结果，因此过期本身不拒绝；令牌 fencing 已保证
+        # 迟到失败不会清理接管者的新租约。
+        if (
+            job["state"] != "leased"
+            or job["lease_owner"] != worker_id
+            or job["lease_operator"] != actor_id
+            or job["lease_token"] != lease_token
+        ):
+            reason = "任务未由当前操作者与节点持有，或租约令牌已变更"
+            self._audit_lease_rejection(
+                "batch", job["batch_id"], "analysis_job.fail_rejected", actor_id,
+                {"job_id": job_id, "worker_id": worker_id, "lease_token": lease_token, "reason": reason},
+            )
+            raise InvalidState(reason)
         available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL," 
-                "last_error=?,updated_at=? WHERE job_id=? AND state='leased' AND lease_owner=?",
-                (available, error[:1000], self._now(), job_id, worker_id),
+                "UPDATE analysis_jobs SET state='queued',available_at=?,lease_owner=NULL,lease_operator=NULL,"
+                "lease_expires_at=NULL,last_error=?,updated_at=? "
+                "WHERE job_id=? AND state='leased' AND lease_owner=? AND lease_operator=? AND lease_token=?",
+                (available, error[:1000], self._now(), job_id, worker_id, actor_id, lease_token),
             )
             if cursor.rowcount != 1:
-                raise InvalidState("任务未由当前工作进程持有")
+                raise InvalidState("任务租约已变化，无法释放")
+            self._audit("batch", job["batch_id"], "analysis_job.failed", actor_id, {
+                "job_id": job_id,
+                "worker_id": worker_id,
+                "operator_id": actor_id,
+                "lease_token": lease_token,
+                "error": error[:1000],
+                "retry_seconds": retry_seconds,
+                "available_at": available,
+            })
         return {"job_id": job_id, "state": "queued", "available_at": available}
 
     def decide(
@@ -538,6 +712,13 @@ class TaxonomyLabService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        jobs = self.connection.execute(
+            "SELECT * FROM analysis_jobs WHERE batch_id=? ORDER BY job_id", (batch_id,)
+        ).fetchall()
+        queue_events = self.connection.execute(
+            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE entity_type=? ORDER BY event_id", (self.QUEUE_ENTITY_TYPE,)
+        ).fetchall()
         return {
             "batch": batch,
             "evidence_protocol": {
@@ -556,5 +737,7 @@ class TaxonomyLabService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "jobs": [dict(row) for row in jobs],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+            "queue_events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in queue_events],
         }
